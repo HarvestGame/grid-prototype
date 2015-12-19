@@ -123,7 +123,7 @@ main = do
       lastUpdate = 0.0
     }
 
-  let grid = Grid {terrainMap = Map.empty, width = 10, height = 10}
+  let grid = Grid {terrainMap = Map.fromList [((0,0), Red)], width = 10, height = 10}
   putStrLn "Ok"
 
   _ <- document `onEvent` KeyDown $ (\evt -> modifyIORef state $ press_key (keyCode evt))
