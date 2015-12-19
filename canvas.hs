@@ -2,128 +2,132 @@
 import Haste
 import Haste.DOM
 import Haste.Events
-import Haste.Graphics.Canvas
+import Haste.Graphics.Canvas as Canvas
+import Haste.Graphics.AnimationFrame
 import Data.IORef
 import Data.Array
 import Data.Array.MArray
 import Data.Array.IO
 
--- | A map contains of a tileset, dimensions and tile data.
-data Tilemap = Tilemap {
-    tileData   :: Array Int Int,
-    tileSet    :: Bitmap,
-    dimensions :: (Int, Int)
-  }
+import qualified Data.IntSet as IntSet
+import qualified Data.Map as Map
 
--- | The state of the program: which tile is currently selected, and what does
---   the map look like?
+data Terrain = Red | Blue | Yellow | White | Black deriving (Ord, Eq)
+
+data Grid = Grid {
+  terrainMap :: Map.Map (Int, Int) Terrain,
+  width :: Int,
+  height :: Int
+}
+
 data State = State {
-    tileMap :: Tilemap,
-    selectedTile :: (Int, Int)
-  }
+  position :: (Double, Double),
+  keyState :: IntSet.IntSet,
+  lastUpdate :: HRTimeStamp
+}
 
--- | Draw a single tile.
---   The tileset is assumed to consist of 11*11 tiles of 16*16 pixels each,
---   separated by a one pixel border.
-drawTile :: Bitmap -> Int -> Point -> Picture ()
-drawTile tileset tile pt = do
-    drawClipped tileset pt (Rect (1+convert tx*17) (1+convert ty*17) 16 16)
-  where
-    (ty, tx) = quotRem tile 11
+cellWidth :: Double
+cellHeight :: Double
 
--- | Update a tile in a tile map. This function is horribly slow, copying the
---   entire map *twice* for each overwrite.
-writeTile :: Tilemap -> (Int, Int) -> Int -> IO Tilemap
-writeTile m@(Tilemap _ _ (w, _)) (x, y) t = do
-  arr <- thaw (tileData m) :: IO (IOArray Int Int)
-  writeArray arr (y*w+x) t
-  arr' <- freeze arr
-  return $ m {tileData = arr'}
+cellWidth = 10.0
+cellHeight = 10.0
 
--- | Draw an entire tile map.
-drawMap :: Tilemap -> Picture ()
-drawMap (Tilemap m ts (w, h)) = do
-  sequence_ [drawTile ts (m ! (y*w+x)) (convert x*16, convert y*16) |
-             x <- [0 .. w-1], y <- [0 .. h-1]]
+colorMap :: Map.Map Terrain Canvas.Color
+colorMap = Map.fromList [(Red, Canvas.RGB 255 0 0), (Black, Canvas.RGB 0 0 0)]
 
--- | Draw a tilemap, then draw a semi-transparent square over the tile that's
---   currently selected.
-drawMapWithSel :: Tilemap -> (Int, Int) -> Picture ()
-drawMapWithSel tilemap (x, y) = do
-    drawMap tilemap
-    color (RGBA 255 255 255 0.5) . fill $ rect (x', y') (x'+16, y'+16)
-  where
-    x' = convert $ x*16
-    y' = convert $ y*16
+drawGrid :: Grid -> Canvas.Picture ()
+drawGrid grid = sequence_ eachPosition where
+  eachPosition :: [Picture ()]
+  eachPosition = do
+    x <- [0..(width grid)]          
+    y <- [0..(height grid)]        
+    return $ drawPosition (x, y) grid
 
--- | Create a tilemap using the specified tileset, dimensions and default tile.
-createMap :: Bitmap -> Int -> Int -> Int -> Tilemap
-createMap tileset w h deftile = Tilemap {
-    tileData   = listArray (0, w*h-1) $ replicate (w*h) deftile,
-    tileSet    = tileset,
-    dimensions = (w, h)
-  }
+renderEverything :: Canvas.Canvas -> Grid -> State -> IO ()
+renderEverything canvas grid state = Canvas.render canvas $ translate (position state) $ drawGrid grid
+
+drawPosition :: (Int, Int) -> Grid -> Canvas.Picture ()
+drawPosition (x, y) grid = Canvas.color terrainColor $ Canvas.stroke square where
+  doubleX = fromIntegral x
+  doubleY = fromIntegral y
+  terrain :: Terrain
+  terrain = Map.findWithDefault Black (x, y) (terrainMap grid) 
+  terrainColor = (Map.!) colorMap terrain
+  square = Canvas.rect (doubleX*cellWidth, doubleY*cellHeight) ((doubleX+1)*cellWidth, (doubleY+1)*cellHeight)
+
+up :: Int
+down :: Int
+right :: Int
+left :: Int
+
+up = 38
+down = 40
+left = 37
+right = 39
+
+update_position :: (Double, Double) -> IntSet.IntSet -> (Double, Double) 
+update_position (x,y) pressedKeys = 
+  if IntSet.member up pressedKeys then
+    (x, y+1)
+  else if IntSet.member down pressedKeys then
+    (x, y-1)
+  else if IntSet.member right pressedKeys then
+    (x-1, y)
+  else if IntSet.member left pressedKeys then
+    (x+1, y)
+  else
+    (x, y)
+
+update_state :: State -> State
+update_state state = state {
+  lastUpdate = (lastUpdate state) + 15.0,
+  position = update_position (position state) (keyState state)
+}
+
+keep_updating_state_until_current :: HRTimeStamp -> State -> State
+keep_updating_state_until_current current_time last_state = 
+  if ((lastUpdate last_state) < current_time) then
+    keep_updating_state_until_current  current_time $ update_state last_state 
+  else
+    last_state  
+
+renderAndUpdate :: Canvas.Canvas -> Grid -> IORef State -> HRTimeStamp -> IO ()
+renderAndUpdate canvas grid state time = do 
+  modifyIORef state $ keep_updating_state_until_current time
+  current_state <- readIORef state
+  renderEverything canvas grid current_state
+  _ <- requestAnimationFrame $ renderAndUpdate canvas grid state
+  return ()
+
+press_key :: Int -> State -> State
+press_key code state = state {keyState = IntSet.insert code (keyState state)}
+
+
+release_key :: Int -> State -> State
+release_key code state = state {keyState = IntSet.delete code (keyState state)}
+
+
 
 main :: IO ()
 main = do
   -- Setup: get the HTML element for a canvas, then proceed to create a canvas
   -- object from it.
-  Just ce <- elemById "canvas"
-  Just c <- getCanvas ce
-  
-  -- Same for the canvas we're using as the tile "toolbox"
-  Just tilemapElem <- elemById "tiles"
-  Just tiles <- getCanvas tilemapElem
-  
-  -- Load our tileset from a PNG file.
-  tileset <- loadBitmap "tileset.png"
 
-  -- The tile toolbox is a tilemap in itself.
-  let allTiles = Tilemap {
-          tileData   = listArray (0, 120) [0..],
-          tileSet    = tileset,
-          dimensions = (11, 11)
-        }
+  Just ce <- elemById "canvas"
+  Just c <- fromElem ce
   
   -- Start the application with the top left element selected and a 10*10 map.
   state <- newIORef $ State {
-      selectedTile = (0, 0),
-      tileMap      = createMap tileset 10 10 12
+      position = (0, 0),
+      keyState  = IntSet.empty,
+      lastUpdate = 0.0
     }
 
-  -- When the user clicks the toolbox, mark the clicked tile as selected.
-  tilemapElem `onEvent` Click $ \(MouseData (x, y) _ _) -> do
-    modifyIORef state $ \st ->
-      st {selectedTile = (x `quot` 32, y `quot` 32)}
-    readIORef state >>= drawEverything allTiles tiles c
-    return ()
+  let grid = Grid {terrainMap = Map.empty, width = 10, height = 10}
+  putStrLn "Ok"
 
-  -- When the user clicks the map, overwrite the clicked tile with the
-  -- currently selected one.
-  ce `onEvent` Click $ \(MouseData (x, y) _ _) -> do
-    st <- readIORef state
-    let (tx, ty) = selectedTile st
-        tile = ty*11 + tx
-    tmap <- writeTile (tileMap st) (x `quot` 32, y `quot` 32) tile
-    let st' = st {tileMap = tmap}
-    writeIORef state st'
-    drawEverything allTiles tiles c st'
-
-  -- Display a "brb loading" message if the user is on a slow connection
-  render c $ text (110, 120) "Loading, please wait..."
+  _ <- document `onEvent` KeyDown $ (\evt -> modifyIORef state $ press_key (keyCode evt))
+  _ <- document `onEvent` KeyUp $ (\evt -> modifyIORef state $ release_key (keyCode evt))
+  _ <- requestAnimationFrame $ renderAndUpdate c grid state
   
-  -- When the tileset finished loading, draw everything.
-  elemOf tileset `onEvent` Load $ \_ -> do
-    readIORef state >>= drawEverything allTiles tiles c
   return ()
-
--- | Render both of our tile maps, then extract the image data from the map
---   as a data URL and write it to the "share your creation" text box.
-drawEverything :: Tilemap -> Canvas -> Canvas -> State -> IO ()
-drawEverything allTiles tiles c st = do
-  render tiles $ scale (2, 2) $ do
-    drawMapWithSel allTiles (selectedTile st)
-  render c $ scale (2, 2) $ do
-    drawMap (tileMap st)
-  Just dataurl <- elemById "dataurl"
-  toDataURL c >>= setProp dataurl "value"
